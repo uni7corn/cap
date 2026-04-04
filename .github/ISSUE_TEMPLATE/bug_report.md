@@ -1,46 +1,39 @@
 ---
-name: Bug report
+name: 🐛 Bug report
 about: Open a bug report
-title: "[BUG]"
+title: "[bug] "
 labels: bug
-assignees: tiagorangel1
-
+assignees: tiagozip
 ---
 
-**Describe the bug**
-A clear and concise description of what the bug is.
+<!--
+before creating an issue, please fill in all fields and provide a meaningful title.
+issues that don't meet these requirements will be closed automatically.
+-->
 
-**Affects:**
-- [] Standalone mode
-- [] Widget
-- [] Server
-- [] WASM
-- [] Solver
-- [] Solver CLI
+**bug description:**
+a clear and concise description of what the bug is and how it happened.
 
-**To Reproduce**
-Steps to reproduce the behavior:
-1. Go to '...'
-2. Click on '....'
-3. Scroll down to '....'
-4. See error
+**affects:**
 
-**Expected behavior**
-A clear and concise description of what you expected to happen.
+- [] standalone
+- [] widget (ui)
+- [] widget (wasm solver)
+- [] js server
+- [] js solver
 
-**Screenshots**
-If applicable, add screenshots to help explain your problem.
+**to reproduce:**
+steps to reproduce the behavior. include as much information as possible, but make sure to redact secrets.
 
-**Desktop (please complete the following information):**
- - OS: [e.g. iOS]
- - Browser [e.g. chrome, safari]
- - Version [e.g. 22]
+**expected behavior:**
+a clear and concise description of what you expected to happen.
 
-**Smartphone (please complete the following information):**
- - Device: [e.g. iPhone6]
- - OS: [e.g. iOS8.1]
- - Browser [e.g. stock browser, safari]
- - Version [e.g. 22]
+**screenshots:**
+if applicable, add screenshots to help explain your problem.
+please use code blocks instead of screenshots for pasting errors, logs and code.
 
-**Additional context**
-Add any other context about the problem here.
+**versions and environment:**
+e.g. browser, os, device, etc
+
+**additional context:**
+add any other context about the problem here.

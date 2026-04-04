@@ -1,80 +1,19 @@
-import fs from "node:fs";
-import { join } from "node:path";
-import { SQL } from "bun";
+import { RedisClient } from "bun";
 
-fs.mkdirSync(process.env.DATA_PATH || "./.data", {
-  recursive: true,
-});
+const redisUrl = process.env.REDIS_URL || process.env.VALKEY_URL || "redis://localhost:6379";
+const db = new RedisClient(redisUrl);
 
-let db;
+await db.send("PING", []);
 
-async function initDb() {
-  const dbUrl = process.env.DB_URL || `sqlite://${join(process.env.DATA_PATH || "./.data", "db.sqlite")}`;
-
-  db = new SQL(dbUrl);
-
-  await db`create table if not exists sessions (
-    token text primary key not null,
-    expires integer not null,
-    created integer not null
-  )`.simple();
-
-  await db`create table if not exists keys (
-    siteKey text primary key not null,
-    name text not null,
-    secretHash text not null,
-    config text not null,
-    created integer not null
-  )`.simple();
-
-  await db`create table if not exists solutions (
-    siteKey text not null,
-    bucket integer not null,
-    count integer default 0,
-    primary key (siteKey, bucket)
-  )`.simple();
-
-  await db`create table if not exists challenges (
-    siteKey text not null,
-    token text not null,
-    data text not null,
-    expires integer not null,
-    primary key (siteKey, token)
-  )`.simple();
-
-  await db`create table if not exists tokens (
-    siteKey text not null,
-    token text not null,
-    expires integer not null,
-    primary key (siteKey, token)
-  )`.simple();
-
-  await db`create table if not exists api_keys (
-    id text not null,
-    name text not null,
-    tokenHash text not null,
-    created integer not null,
-    primary key (id, tokenHash)
-  )`.simple();
-
-  setInterval(async () => {
-    const now = Date.now();
-
-    await db`delete from sessions where expires < ${now}`;
-    await db`delete from tokens where expires < ${now}`;
-    await db`delete from challenges where expires < ${now}`;
-  }, 60 * 1000);
-
-
-  const now = Date.now();
-
-  await db`delete from sessions where expires < ${now}`;
-  await db`delete from tokens where expires < ${now}`;
-  await db`delete from challenges where expires < ${now}`;
-
-  return db;
+export async function hgetall(key) {
+  const data = await db.send("HGETALL", [key]);
+  if (!data) return {};
+  if (typeof data === "object" && !Array.isArray(data)) return data;
+  const obj = {};
+  for (let i = 0; i < data.length; i += 2) {
+    obj[data[i]] = data[i + 1];
+  }
+  return obj;
 }
-
-db = await initDb();
 
 export { db };

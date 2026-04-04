@@ -2,9 +2,11 @@
 
 Want to use Cap without the standalone server and with a different language? Here are some community-maintained libraries that might help. If you want to add a library, feel free to open a pull request!
 
+**Note:** These libraries frequently do **not** support new features such as seeded challenges or instrumentation challenges.
+
 ## Widgets
 
-These are wrappers around Cap's widget. They're usually not required as the default widget should work everywhere but can result in better development experience.
+These are wrappers around Cap's widget. They're usually not required as the default widget should work everywhere but can result in a better development experience.
 
 ### React
 
@@ -14,6 +16,10 @@ These are wrappers around Cap's widget. They're usually not required as the defa
 ### Angular
 
 - **[@espressotutorialsgmbh/cap-angular-widget](https://www.npmjs.com/package/@espressotutorialsgmbh/cap-angular-widget)**
+
+### Vue
+
+- **[nuxt-cap](https://github.com/dethdkn/nuxt-cap)**
 
 ### Other
 
@@ -28,6 +34,10 @@ These are React hook implementations of the Cap API, allowing full customization
 ## Server
 
 **Warning:** These libraries are community-maintained and not officially supported or actively monitored for security by Cap. We can't guarantee their quality, security, or compatibility. They also might not support newer features such as storage hooks or seeded challenges.
+
+### Cloudflare Workers (Serverless/JavaScript)
+
+- **[kaerez/CFCap](https://github.com/kaerez/CFCap)**: Serverless CAP CAPTCHA implementation on Cloudflare Workers with R2 Buckets (cheaper than Durable Objects), featuring customizable TTLs, optional use of hosted JS & WASM, global edge deployment and auto-scaling
 
 ### Cloudflare Workers (Serverless/JavaScript/TypeScript)
 
@@ -46,6 +56,7 @@ These are React hook implementations of the Cap API, allowing full customization
 
 ### Python
 
+- **[capjs-server](https://github.com/vshn/capjs-server)**: Stateless Python server library for Cap token verification (no database required)
 - **[django-cap](https://pypi.org/project/django-cap/)**: Python implementation for Cap's server with Django
 
 ### .NET

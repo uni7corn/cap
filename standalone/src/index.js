@@ -4,7 +4,10 @@ import { Elysia, file } from "elysia";
 import { assetsServer } from "./assets.js";
 import { auth } from "./auth.js";
 import { capServer } from "./cap.js";
+import { isDemoMode } from "./demo.js";
+import { loadIPDB } from "./ipdb.js";
 import { server } from "./server.js";
+import { loadHeaders, loadRatelimit, loadCorsDefault, loadFiltering } from "./settings-cache.js";
 import { siteverifyServer } from "./siteverify.js";
 
 const serverPort = process.env.SERVER_PORT || 3000;
@@ -26,8 +29,7 @@ new Elysia({
         tags: [
           {
             name: "Keys",
-            description:
-              "Managing, creating and viewing keys. Requires API or session token",
+            description: "Managing, creating and viewing keys. Requires API or session token",
           },
           {
             name: "Settings",
@@ -45,7 +47,7 @@ new Elysia({
         ],
         info: {
           title: "Cap Standalone",
-          version: "2.0.0",
+          version: "3.0.0",
           description:
             "API endpoints for Cap Standalone. Both Keys and Settings endpoints require an API key or session token.\n\n[Learn more](https://capjs.js.org)",
         },
@@ -55,18 +57,53 @@ new Elysia({
           },
         },
       },
-    })
+    }),
   )
   .onBeforeHandle(({ set }) => {
     set.headers["X-Powered-By"] = "Cap Standalone";
   })
+  .onError(({ error, code }) => {
+    if (["VALIDATION", "NOT_FOUND"].includes(code)) {
+      return {
+        success: false,
+        error: error.code || "Internal server error",
+        detail: error,
+      };
+    }
+
+    const errorId = Bun.randomUUIDv7().split("-").pop();
+
+    if (process.env.DISABLE_ERROR_LOGGING !== "true") {
+      console.error(
+        `[${error.code || "ERR"} ${errorId}]`,
+        JSON.stringify({
+          timestamp: new Date().toISOString(),
+          error,
+          env: {
+            bun: process.versions.bun,
+            platform: process.platform,
+            mem: process.memoryUsage(),
+          },
+        }),
+      );
+    }
+
+    return {
+      success: false,
+      error: error.code || "Internal server error",
+      detail:
+        process.env.SHOW_ERRORS === "true"
+          ? error
+          : {
+              troubleshooting: "http://capjs.js.org/guide/standalone/options.html#error-messages",
+              id: errorId,
+            },
+    };
+  })
   .use(staticPlugin())
   .get("/", async ({ cookie }) => {
-    return file(
-      cookie.cap_authed?.value === "yes"
-        ? "./public/index.html"
-        : "./public/login.html"
-    );
+    if (isDemoMode()) return file("./public/index.html");
+    return file(cookie.cap_authed?.value === "yes" ? "./public/index.html" : "./public/login.html");
   })
   .use(auth)
   .use(server)
@@ -76,3 +113,9 @@ new Elysia({
   .listen(serverPort);
 
 console.log(`🧢 Cap running on http://${serverHostname}:${serverPort}`);
+
+await loadHeaders();
+await loadRatelimit();
+await loadCorsDefault();
+await loadFiltering();
+loadIPDB().catch((e) => console.warn("[cap] IP DB load:", e.message));

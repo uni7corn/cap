@@ -56,6 +56,7 @@ interface CapConfig {
   "data-cap-i18n-verified-aria-label"?: string;
   "data-cap-i18n-error-aria-label"?: string;
   "data-cap-i18n-wasm-disabled"?: string;
+  "data-cap-troubleshooting-url"?: string;
   onsolve?: string;
   onprogress?: string;
   onreset?: string;
@@ -70,40 +71,16 @@ interface CapWidget extends HTMLElement {
   reset(): void;
   setWorkersCount(workers: number): void;
 
-  addEventListener(
-    type: "progress",
-    listener: (event: CapProgressEvent) => void
-  ): void;
-  addEventListener(
-    type: "solve",
-    listener: (event: CapSolveEvent) => void
-  ): void;
-  addEventListener(
-    type: "error",
-    listener: (event: CapErrorEvent) => void
-  ): void;
-  addEventListener(
-    type: "reset",
-    listener: (event: CapResetEvent) => void
-  ): void;
+  addEventListener(type: "progress", listener: (event: CapProgressEvent) => void): void;
+  addEventListener(type: "solve", listener: (event: CapSolveEvent) => void): void;
+  addEventListener(type: "error", listener: (event: CapErrorEvent) => void): void;
+  addEventListener(type: "reset", listener: (event: CapResetEvent) => void): void;
   addEventListener(type: string, listener: EventListener): void;
 
-  removeEventListener(
-    type: "progress",
-    listener: (event: CapProgressEvent) => void
-  ): void;
-  removeEventListener(
-    type: "solve",
-    listener: (event: CapSolveEvent) => void
-  ): void;
-  removeEventListener(
-    type: "error",
-    listener: (event: CapErrorEvent) => void
-  ): void;
-  removeEventListener(
-    type: "reset",
-    listener: (event: CapResetEvent) => void
-  ): void;
+  removeEventListener(type: "progress", listener: (event: CapProgressEvent) => void): void;
+  removeEventListener(type: "solve", listener: (event: CapSolveEvent) => void): void;
+  removeEventListener(type: "error", listener: (event: CapErrorEvent) => void): void;
+  removeEventListener(type: "reset", listener: (event: CapResetEvent) => void): void;
   removeEventListener(type: string, listener: EventListener): void;
 }
 
@@ -116,22 +93,10 @@ declare class Cap {
   solve(): Promise<SolveResult>;
   reset(): void;
 
-  addEventListener(
-    type: "progress",
-    listener: (event: CapProgressEvent) => void
-  ): void;
-  addEventListener(
-    type: "solve",
-    listener: (event: CapSolveEvent) => void
-  ): void;
-  addEventListener(
-    type: "error",
-    listener: (event: CapErrorEvent) => void
-  ): void;
-  addEventListener(
-    type: "reset",
-    listener: (event: CapResetEvent) => void
-  ): void;
+  addEventListener(type: "progress", listener: (event: CapProgressEvent) => void): void;
+  addEventListener(type: "solve", listener: (event: CapSolveEvent) => void): void;
+  addEventListener(type: "error", listener: (event: CapErrorEvent) => void): void;
+  addEventListener(type: "reset", listener: (event: CapResetEvent) => void): void;
   addEventListener(type: string, listener: EventListener): void;
 }
 

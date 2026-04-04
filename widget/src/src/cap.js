@@ -1,623 +1,1305 @@
 (() => {
-	const WASM_VERSION = "0.0.6";
+  const WASM_VERSION = "0.0.6";
+  const _browserHasHaptics =
+    "vibrate" in navigator && !window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 
-	if (typeof window === "undefined") {
+  if (typeof window === "undefined") {
     return;
   }
 
-	const capFetch = (...args) => {
-		if (window?.CAP_CUSTOM_FETCH) {
-			return window.CAP_CUSTOM_FETCH(...args);
-		}
-		return fetch(...args);
-	};
-
-	function prng(seed, length) {
-		function fnv1a(str) {
-			let hash = 2166136261;
-			for (let i = 0; i < str.length; i++) {
-				hash ^= str.charCodeAt(i);
-				hash +=
-					(hash << 1) + (hash << 4) + (hash << 7) + (hash << 8) + (hash << 24);
-			}
-			return hash >>> 0;
-		}
-
-		let state = fnv1a(seed);
-		let result = "";
-
-		function next() {
-			state ^= state << 13;
-			state ^= state >>> 17;
-			state ^= state << 5;
-			return state >>> 0;
-		}
-
-		while (result.length < length) {
-			const rnd = next();
-			result += rnd.toString(16).padStart(8, "0");
-		}
-
-		return result.substring(0, length);
-	}
-
-	if (!window.CAP_CUSTOM_WASM_URL) {
-		// preloads the wasm files to save up time on solve
-		[
-			`https://cdn.jsdelivr.net/npm/@cap.js/wasm@${WASM_VERSION}/browser/cap_wasm.min.js`,
-			`https://cdn.jsdelivr.net/npm/@cap.js/wasm@${WASM_VERSION}/browser/cap_wasm_bg.wasm`,
-		].forEach((url) => {
-			const link = document.createElement("link");
-			link.rel = "prefetch";
-			link.href = url;
-			link.as = url.endsWith(".wasm") ? "fetch" : "script";
-			document.head.appendChild(link);
-		});
-	}
-
-	class CapWidget extends HTMLElement {
-		#workerUrl = "";
-		#resetTimer = null;
-		#workersCount = navigator.hardwareConcurrency || 8;
-		token = null;
-		#shadow;
-		#div;
-		#host;
-		#solving = false;
-		#eventHandlers;
-
-		getI18nText(key, defaultValue) {
-			return this.getAttribute(`data-cap-i18n-${key}`) || defaultValue;
-		}
-
-		static get observedAttributes() {
-			return [
-				"onsolve",
-				"onprogress",
-				"onreset",
-				"onerror",
-				"data-cap-worker-count",
-				"data-cap-i18n-initial-state",
-				"[cap]",
-			];
-		}
-
-		constructor() {
-			super();
-			if (this.#eventHandlers) {
-				this.#eventHandlers.forEach((handler, eventName) => {
-					this.removeEventListener(eventName.slice(2), handler);
-				});
-			}
-
-			this.#eventHandlers = new Map();
-			this.boundHandleProgress = this.handleProgress.bind(this);
-			this.boundHandleSolve = this.handleSolve.bind(this);
-			this.boundHandleError = this.handleError.bind(this);
-			this.boundHandleReset = this.handleReset.bind(this);
-		}
-
-		initialize() {
-			this.#workerUrl = URL.createObjectURL(
-				// this placeholder will be replaced with the actual worker by the build script
-
-				new Blob([`%%workerScript%%`], {
-					type: "application/javascript",
-				}),
-			);
-		}
-
-		attributeChangedCallback(name, _, value) {
-			if (name.startsWith("on")) {
-				const eventName = name.slice(2);
-				const oldHandler = this.#eventHandlers.get(name);
-				if (oldHandler) {
-					this.removeEventListener(eventName, oldHandler);
-				}
-
-				if (value) {
-					const handler = (event) => {
-						const callback = this.getAttribute(name);
-						if (typeof window[callback] === "function") {
-							window[callback].call(this, event);
-						}
-					};
-					this.#eventHandlers.set(name, handler);
-					this.addEventListener(eventName, handler);
-				}
-			}
-
-			if (name === "data-cap-worker-count") {
-				this.setWorkersCount(parseInt(value, 10));
-			}
-
-			if (
-				name === "data-cap-i18n-initial-state" &&
-				this.#div &&
-				this.#div?.querySelector("p")?.innerText
-			) {
-				this.#div.querySelector("p").innerText = this.getI18nText(
-					"initial-state",
-					"I'm a human",
-				);
-			}
-		}
-
-		async connectedCallback() {
-			this.#host = this;
-			this.#shadow = this.attachShadow({ mode: "open" });
-			this.#div = document.createElement("div");
-			this.createUI();
-			this.addEventListeners();
-			this.initialize();
-			this.#div.removeAttribute("disabled");
-
-			const workers = this.getAttribute("data-cap-worker-count");
-			const parsedWorkers = workers ? parseInt(workers, 10) : null;
-			this.setWorkersCount(parsedWorkers || navigator.hardwareConcurrency || 8);
-			const fieldName =
-				this.getAttribute("data-cap-hidden-field-name") || "cap-token";
-			this.#host.innerHTML = `<input type="hidden" name="${fieldName}">`;
-		}
-
-		async solve() {
-			if (this.#solving) {
-				return;
-			}
-
-			try {
-				this.#solving = true;
-				this.updateUI(
-					"verifying",
-					this.getI18nText("verifying-label", "Verifying..."),
-					true,
-				);
-
-				this.#div.setAttribute(
-					"aria-label",
-					this.getI18nText(
-						"verifying-aria-label",
-						"Verifying you're a human, please wait",
-					),
-				);
-
-				this.dispatchEvent("progress", { progress: 0 });
-
-				try {
-					let apiEndpoint = this.getAttribute("data-cap-api-endpoint");
-
-					if (!apiEndpoint && window?.CAP_CUSTOM_FETCH) {
-						apiEndpoint = "/";
-					} else if (!apiEndpoint)
-						throw new Error(
-							"Missing API endpoint. Either custom fetch or an API endpoint must be provided.",
-						);
-
-					const { challenge, token } = await (
-						await capFetch(`${apiEndpoint}challenge`, {
-							method: "POST",
-						})
-					).json();
-
-					let challenges = challenge;
-
-					if (!Array.isArray(challenges)) {
-						let i = 0;
-
-						challenges = Array.from({ length: challenge.c }, () => {
-							i = i + 1;
-
-							return [
-								prng(`${token}${i}`, challenge.s),
-								prng(`${token}${i}d`, challenge.d),
-							];
-						});
-					}
-
-					const solutions = await this.solveChallenges(challenges);
-
-					const resp = await (
-						await capFetch(`${apiEndpoint}redeem`, {
-							method: "POST",
-							body: JSON.stringify({ token, solutions }),
-							headers: { "Content-Type": "application/json" },
-						})
-					).json();
-
-					this.dispatchEvent("progress", { progress: 100 });
-
-					if (!resp.success) throw new Error("Invalid solution");
-					const fieldName =
-						this.getAttribute("data-cap-hidden-field-name") || "cap-token";
-					if (this.querySelector(`input[name='${fieldName}']`)) {
-						this.querySelector(`input[name='${fieldName}']`).value = resp.token;
-					}
-
-					this.dispatchEvent("solve", { token: resp.token });
-					this.token = resp.token;
-
-					if (this.#resetTimer) clearTimeout(this.#resetTimer);
-					const expiresIn = new Date(resp.expires).getTime() - Date.now();
-					if (expiresIn > 0 && expiresIn < 24 * 60 * 60 * 1000) {
-						this.#resetTimer = setTimeout(() => this.reset(), expiresIn);
-					} else {
-						this.error("Invalid expiration time");
-					}
-
-					this.#div.setAttribute(
-						"aria-label",
-						this.getI18nText(
-							"verified-aria-label",
-							"We have verified you're a human, you may now continue",
-						),
-					);
-
-					return { success: true, token: this.token };
-				} catch (err) {
-					this.#div.setAttribute(
-						"aria-label",
-						this.getI18nText(
-							"error-aria-label",
-							"An error occurred, please try again",
-						),
-					);
-					this.error(err.message);
-					throw err;
-				}
-			} finally {
-				this.#solving = false;
-			}
-		}
-
-		async solveChallenges(challenge) {
-			const total = challenge.length;
-			let completed = 0;
-
-			const workers = Array(this.#workersCount)
-				.fill(null)
-				.map(() => {
-					try {
-						return new Worker(this.#workerUrl);
-					} catch (error) {
-						console.error("[cap] Failed to create worker:", error);
-						throw new Error("Worker creation failed");
-					}
-				});
-
-			const solveSingleChallenge = ([salt, target], workerId) =>
-				new Promise((resolve, reject) => {
-					const worker = workers[workerId];
-					if (!worker) {
-						reject(new Error("Worker not available"));
-						return;
-					}
-
-					const timeout = setTimeout(() => {
-						try {
-							worker.terminate();
-							workers[workerId] = new Worker(this.#workerUrl);
-						} catch (error) {
-							console.error(
-								"[cap] error terminating/recreating worker:",
-								error,
-							);
-						}
-						reject(new Error("Worker timeout"));
-					}, 30000);
-
-					worker.onmessage = ({ data }) => {
-						if (!data.found) return;
-						clearTimeout(timeout);
-						completed++;
-						this.dispatchEvent("progress", {
-							progress: Math.round((completed / total) * 100),
-						});
-
-						resolve(data.nonce);
-					};
-
-					worker.onerror = (err) => {
-						clearTimeout(timeout);
-						this.error(`Error in worker: ${err.message || err}`);
-						reject(err);
-					};
-
-					worker.postMessage({
-						salt,
-						target,
-						wasmUrl:
-							window.CAP_CUSTOM_WASM_URL ||
-							`https://cdn.jsdelivr.net/npm/@cap.js/wasm@${WASM_VERSION}/browser/cap_wasm.min.js`,
-					});
-
-					if (
-						typeof WebAssembly !== "object" ||
-						typeof WebAssembly?.instantiate !== "function"
-					) {
-						if (this.#shadow.querySelector(".warning")) return;
-						const warningEl = document.createElement("div");
-						warningEl.className = "warning";
-						warningEl.style.cssText = `width: var(--cap-widget-width, 230px);background: rgb(237, 56, 46);color: white;padding: 4px 6px;padding-bottom: calc(var(--cap-border-radius, 14px) + 5px);font-size: 10px;box-sizing: border-box;font-family: system-ui;border-top-left-radius: 8px;border-top-right-radius: 8px;text-align: center;padding-bottom:calc(var(--cap-border-radius,14px) + 5px);user-select:none;margin-bottom: -35.5px;opacity: 0;transition: margin-bottom .3s,opacity .3s;`;
-						warningEl.innerText =
-							this.getI18nText("wasm-disabled", "Enable WASM for significantly faster solving");
-						this.#shadow.insertBefore(warningEl, this.#shadow.firstChild);
-
-						setTimeout(() => {
-							warningEl.style.marginBottom = `calc(-1 * var(--cap-border-radius, 14px))`
-							warningEl.style.opacity = 1;
-						}, 10);
-					}
-				});
-
-			const results = [];
-			try {
-				for (let i = 0; i < challenge.length; i += this.#workersCount) {
-					const chunk = challenge.slice(
-						i,
-						Math.min(i + this.#workersCount, challenge.length),
-					);
-					const chunkResults = await Promise.all(
-						chunk.map((c, idx) => solveSingleChallenge(c, idx)),
-					);
-					results.push(...chunkResults);
-				}
-			} finally {
-				workers.forEach((w) => {
-					if (w) {
-						try {
-							w.terminate();
-						} catch (error) {
-							console.error("[cap] error terminating worker:", error);
-						}
-					}
-				});
-			}
-
-			return results;
-		}
-
-		setWorkersCount(workers) {
-			const parsedWorkers = parseInt(workers, 10);
-			const maxWorkers = Math.min(navigator.hardwareConcurrency || 8, 16);
-			this.#workersCount =
-				!Number.isNaN(parsedWorkers) &&
-				parsedWorkers > 0 &&
-				parsedWorkers <= maxWorkers
-					? parsedWorkers
-					: navigator.hardwareConcurrency || 8;
-		}
-
-		createUI() {
-			this.#div.classList.add("captcha");
-			this.#div.setAttribute("role", "button");
-			this.#div.setAttribute("tabindex", "0");
-			this.#div.setAttribute(
-				"aria-label",
-				this.getI18nText("verify-aria-label", "Click to verify you're a human"),
-			);
-			this.#div.setAttribute("aria-live", "polite");
-			this.#div.setAttribute("disabled", "true");
-			this.#div.innerHTML = `<div class="checkbox" part="checkbox"><svg class="progress-ring" viewBox="0 0 32 32"><circle class="progress-ring-bg" cx="16" cy="16" r="14"></circle><circle class="progress-ring-circle" cx="16" cy="16" r="14"></circle></svg></div><p part="label">${this.getI18nText(
-				"initial-state",
-				"I'm a human",
-			)}</p><a part="attribution" aria-label="Secured by Cap" href="https://capjs.js.org/" class="credits" target="_blank" rel="follow noopener">Cap</a>`;
-
-			this.#shadow.innerHTML = `<style${window.CAP_CSS_NONCE ? ` nonce=${window.CAP_CSS_NONCE}` : ""}>.captcha,.captcha * {box-sizing:border-box;}.captcha{background-color:var(--cap-background,#fdfdfd);border:1px solid var(--cap-border-color,#dddddd8f);border-radius:var(--cap-border-radius,14px);user-select:none;height:var(--cap-widget-height, 58px);width:var(--cap-widget-width, 230px);display:flex;align-items:center;padding:var(--cap-widget-padding,14px);gap:var(--cap-gap,15px);cursor:pointer;transition:filter .2s,transform .2s;position:relative;-webkit-tap-highlight-color:rgba(255,255,255,0);overflow:hidden;color:var(--cap-color,#212121)}.captcha:hover{filter:brightness(98%)}.checkbox{width:var(--cap-checkbox-size,25px);height:var(--cap-checkbox-size,25px);border:var(--cap-checkbox-border,1px solid #aaaaaad1);border-radius:var(--cap-checkbox-border-radius,6px);background-color:var(--cap-checkbox-background,#fafafa91);transition:opacity .2s;margin-top:var(--cap-checkbox-margin,2px);margin-bottom:var(--cap-checkbox-margin,2px)}.captcha *{font-family:var(--cap-font,system,-apple-system,"BlinkMacSystemFont",".SFNSText-Regular","San Francisco","Roboto","Segoe UI","Helvetica Neue","Lucida Grande","Ubuntu","arial",sans-serif)}.captcha p{margin:0;font-weight:500;font-size:15px;user-select:none;transition:opacity .2s}.checkbox .progress-ring{display:none;width:100%;height:100%;transform:rotate(-90deg)}.checkbox .progress-ring-bg{fill:none;stroke:var(--cap-spinner-background-color,#eee);stroke-width:var(--cap-spinner-thickness,3)}.checkbox .progress-ring-circle{fill:none;stroke:var(--cap-spinner-color,#000);stroke-width:var(--cap-spinner-thickness,3);stroke-linecap:round;stroke-dasharray:87.96;stroke-dashoffset:87.96;transition:stroke-dashoffset 0.3s ease}.captcha[data-state=verifying] .checkbox{background:none;display:flex;align-items:center;justify-content:center;transform:scale(1.1);border:none;border-radius:50%;background-color:transparent}.captcha[data-state=verifying] .checkbox .progress-ring{display:block}.captcha[data-state=done] .checkbox{border:1px solid transparent;background-image:var(--cap-checkmark,url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20width%3D%2224%22%20height%3D%2224%22%20viewBox%3D%220%200%2024%2024%22%3E%3Cstyle%3E%40keyframes%20anim%7B0%25%7Bstroke-dashoffset%3A23.21320343017578px%7Dto%7Bstroke-dashoffset%3A0%7D%7D%3C%2Fstyle%3E%3Cpath%20fill%3D%22none%22%20stroke%3D%22%2300a67d%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%20stroke-width%3D%222%22%20d%3D%22m5%2012%205%205L20%207%22%20style%3D%22stroke-dashoffset%3A0%3Bstroke-dasharray%3A23.21320343017578px%3Banimation%3Aanim%20.5s%20ease%22%2F%3E%3C%2Fsvg%3E"));background-size:cover}.captcha[data-state=done] .checkbox .progress-ring{display:none}.captcha[data-state=error] .checkbox{border:1px solid transparent;background-image:var(--cap-error-cross,url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='96' height='96' viewBox='0 0 24 24'%3E%3Cpath fill='%23f55b50' d='M11 15h2v2h-2zm0-8h2v6h-2zm1-5C6.47 2 2 6.5 2 12a10 10 0 0 0 10 10a10 10 0 0 0 10-10A10 10 0 0 0 12 2m0 18a8 8 0 0 1-8-8a8 8 0 0 1 8-8a8 8 0 0 1 8 8a8 8 0 0 1-8 8'/%3E%3C/svg%3E"));background-size:cover}.captcha[data-state=error] .checkbox .progress-ring{display:none}.captcha[disabled]{cursor:not-allowed}.captcha[disabled][data-state=verifying]{cursor:progress}.captcha[disabled][data-state=done]{cursor:default}.captcha .credits{position:absolute;bottom:10px;right:10px;font-size:12px;color:var(--cap-color,#212121);opacity:0.8;text-underline-offset: 1.5px;}</style>`;
-
-			this.#shadow.appendChild(this.#div);
-		}
-
-		addEventListeners() {
-			if (!this.#div) return;
-
-			this.#div.querySelector("a").addEventListener("click", (e) => {
-				e.stopPropagation();
-				e.preventDefault();
-				window.open("https://capjs.js.org", "_blank");
-			});
-
-			this.#div.addEventListener("click", () => {
-				if (!this.#div.hasAttribute("disabled")) this.solve();
-			});
-
-			this.#div.addEventListener("keydown", (e) => {
-				if (
-					(e.key === "Enter" || e.key === " ") &&
-					!this.#div.hasAttribute("disabled")
-				) {
-					e.preventDefault();
-					e.stopPropagation();
-					this.solve();
-				}
-			});
-
-			this.addEventListener("progress", this.boundHandleProgress);
-			this.addEventListener("solve", this.boundHandleSolve);
-			this.addEventListener("error", this.boundHandleError);
-			this.addEventListener("reset", this.boundHandleReset);
-		}
-
-		updateUI(state, text, disabled = false) {
-			if (!this.#div) return;
-
-			this.#div.setAttribute("data-state", state);
-
-			this.#div.querySelector("p").innerText = text;
-
-			if (disabled) {
-				this.#div.setAttribute("disabled", "true");
-			} else {
-				this.#div.removeAttribute("disabled");
-			}
-		}
-
-		handleProgress(event) {
-			if (!this.#div) return;
-
-			const progressElement = this.#div.querySelector("p");
-			const progressCircle = this.#div.querySelector(".progress-ring-circle");
-
-			if (progressElement && progressCircle) {
-				const circumference = 2 * Math.PI * 14;
-				const offset = circumference - (event.detail.progress / 100) * circumference;
-				progressCircle.style.strokeDashoffset = offset;
-				progressElement.innerText = `${this.getI18nText(
-					"verifying-label",
-					"Verifying...",
-				)} ${event.detail.progress}%`;
-			}
-			this.executeAttributeCode("onprogress", event);
-		}
-
-		handleSolve(event) {
-			this.updateUI(
-				"done",
-				this.getI18nText("solved-label", "You're a human"),
-				true,
-			);
-			this.executeAttributeCode("onsolve", event);
-		}
-
-		handleError(event) {
-			this.updateUI(
-				"error",
-				this.getI18nText("error-label", "Error. Try again."),
-			);
-			this.executeAttributeCode("onerror", event);
-		}
-
-		handleReset(event) {
-			this.updateUI("", this.getI18nText("initial-state", "I'm a human"));
-			this.executeAttributeCode("onreset", event);
-		}
-
-		executeAttributeCode(attributeName, event) {
-			const code = this.getAttribute(attributeName);
-			if (!code) {
-				return;
-			}
-
-			new Function("event", code).call(this, event);
-		}
-
-		error(message = "Unknown error") {
-			console.error("[cap]", message);
-			this.dispatchEvent("error", { isCap: true, message });
-		}
-
-		dispatchEvent(eventName, detail = {}) {
-			const event = new CustomEvent(eventName, {
-				bubbles: true,
-				composed: true,
-				detail,
-			});
-			super.dispatchEvent(event);
-		}
-
-		reset() {
-			if (this.#resetTimer) {
-				clearTimeout(this.#resetTimer);
-				this.#resetTimer = null;
-			}
-			this.dispatchEvent("reset");
-			this.token = null;
-			const fieldName =
-				this.getAttribute("data-cap-hidden-field-name") || "cap-token";
-			if (this.querySelector(`input[name='${fieldName}']`)) {
-				this.querySelector(`input[name='${fieldName}']`).value = "";
-			}
-		}
-
-		get tokenValue() {
-			return this.token;
-		}
-
-		disconnectedCallback() {
-			this.removeEventListener("progress", this.boundHandleProgress);
-			this.removeEventListener("solve", this.boundHandleSolve);
-			this.removeEventListener("error", this.boundHandleError);
-			this.removeEventListener("reset", this.boundHandleReset);
-
-			this.#eventHandlers.forEach((handler, eventName) => {
-				this.removeEventListener(eventName.slice(2), handler);
-			});
-			this.#eventHandlers.clear();
-
-			if (this.#shadow) {
-				this.#shadow.innerHTML = "";
-			}
-
-			this.reset();
-			this.cleanup();
-		}
-
-		cleanup() {
-			if (this.#resetTimer) {
-				clearTimeout(this.#resetTimer);
-				this.#resetTimer = null;
-			}
-
-			if (this.#workerUrl) {
-				URL.revokeObjectURL(this.#workerUrl);
-				this.#workerUrl = "";
-			}
-		}
-	}
-
-	// MARK: Invisible
-	class Cap {
-		constructor(config = {}, el) {
-			const widget = el || document.createElement("cap-widget");
-
-			Object.entries(config).forEach(([a, b]) => {
-				widget.setAttribute(a, b);
-			});
-
-			if (!config.apiEndpoint && !window?.CAP_CUSTOM_FETCH) {
-				widget.remove();
-				throw new Error(
-					"Missing API endpoint. Either custom fetch or an API endpoint must be provided.",
-				);
-			}
-
-			if (config.apiEndpoint) {
-				widget.setAttribute("data-cap-api-endpoint", config.apiEndpoint);
-			}
-
-			this.widget = widget;
-			this.solve = this.widget.solve.bind(this.widget);
-			this.reset = this.widget.reset.bind(this.widget);
-			this.addEventListener = this.widget.addEventListener.bind(this.widget);
-
-			Object.defineProperty(this, "token", {
-				get: () => widget.token,
-				configurable: true,
-				enumerable: true,
-			});
-
-			if (!el) {
-				widget.style.display = "none";
-				document.documentElement.appendChild(widget);
-			}
-		}
-	}
-	window.Cap = Cap;
-
-	if (!customElements.get("cap-widget") && !window?.CAP_DONT_SKIP_REDEFINE) {
-		customElements.define("cap-widget", CapWidget);
-	} else {
-		console.warn(
-			"[cap] the cap-widget element has already been defined, skipping re-defining it.\nto prevent this, set window.CAP_DONT_SKIP_REDEFINE to true",
-		);
-	}
-
-	if (typeof exports === "object" && typeof module !== "undefined") {
-		module.exports = Cap;
-	} else if (typeof define === "function" && define.amd) {
-		define([], () => Cap);
-	}
-
-	if (typeof exports !== "undefined") {
-		exports.default = Cap;
-	}
+  const capFetch = (u, conf = {}) => {
+    if (window?.CAP_CUSTOM_FETCH) {
+      return window.CAP_CUSTOM_FETCH(u, conf);
+    }
+
+    return fetch(u, conf);
+  };
+
+  function prng(seed, length) {
+    function fnv1a(str) {
+      let hash = 2166136261;
+      for (let i = 0; i < str.length; i++) {
+        hash ^= str.charCodeAt(i);
+        hash += (hash << 1) + (hash << 4) + (hash << 7) + (hash << 8) + (hash << 24);
+      }
+      return hash >>> 0;
+    }
+
+    let state = fnv1a(seed);
+    let result = "";
+
+    function next() {
+      state ^= state << 13;
+      state ^= state >>> 17;
+      state ^= state << 5;
+      return state >>> 0;
+    }
+
+    while (result.length < length) {
+      const rnd = next();
+      result += rnd.toString(16).padStart(8, "0");
+    }
+
+    return result.substring(0, length);
+  }
+
+  async function runInstrumentationChallenge(instrBytes) {
+    const b64ToUint8 = (b64) => {
+      const bin = atob(b64);
+      const arr = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+      return arr;
+    };
+
+    var compressed = b64ToUint8(instrBytes);
+
+    const scriptText = await new Promise((resolve, reject) => {
+      try {
+        var ds = new DecompressionStream("deflate-raw");
+        var writer = ds.writable.getWriter();
+        var reader = ds.readable.getReader();
+        var chunks = [];
+        function pump(res) {
+          if (res.done) {
+            var len = 0,
+              off = 0;
+            for (var i = 0; i < chunks.length; i++) len += chunks[i].length;
+            var out = new Uint8Array(len);
+            for (var i = 0; i < chunks.length; i++) {
+              out.set(chunks[i], off);
+              off += chunks[i].length;
+            }
+            resolve(new TextDecoder().decode(out));
+          } else {
+            chunks.push(res.value);
+            reader.read().then(pump).catch(reject);
+          }
+        }
+        reader.read().then(pump).catch(reject);
+        writer
+          .write(compressed)
+          .then(() => {
+            writer.close();
+          })
+          .catch(reject);
+      } catch (e) {
+        reject(e);
+      }
+    });
+
+    return new Promise((resolve) => {
+      var timeout = setTimeout(() => {
+        cleanup();
+        resolve({ __timeout: true });
+      }, 20000);
+
+      var iframe = document.createElement("iframe");
+      iframe.setAttribute("sandbox", "allow-scripts");
+      iframe.setAttribute("aria-hidden", "true");
+      iframe.style.cssText =
+        "position:absolute;width:1px;height:1px;top:-9999px;left:-9999px;border:none;opacity:0;pointer-events:none;";
+
+      var resolved = false;
+      function cleanup() {
+        if (resolved) return;
+        resolved = true;
+        clearTimeout(timeout);
+        window.removeEventListener("message", handler);
+        if (iframe.parentNode) iframe.parentNode.removeChild(iframe);
+      }
+
+      function handler(ev) {
+        var d = ev.data;
+        if (!d || typeof d !== "object") return;
+        if (d.type === "cap:instr") {
+          cleanup();
+          if (d.blocked) {
+            resolve({
+              __blocked: true,
+              blockReason: d.blockReason || "automated_browser",
+            });
+          } else if (d.result) {
+            resolve(d.result);
+          } else {
+            resolve({ __timeout: true });
+          }
+        } else if (d.type === "cap:error") {
+          cleanup();
+          resolve({ __timeout: true });
+        }
+      }
+
+      window.addEventListener("message", handler);
+
+      iframe.srcdoc =
+        '<!DOCTYPE html><html><head><meta charset="UTF-8"></head><body><script>' +
+        scriptText +
+        "\n</scr" +
+        "ipt></body></html>";
+
+      document.body.appendChild(iframe);
+    });
+  }
+
+  let wasmModulePromise = null;
+
+  const getWasmModule = () => {
+    if (wasmModulePromise) return wasmModulePromise;
+
+    const wasmUrl =
+      window.CAP_CUSTOM_WASM_URL ||
+      `https://cdn.jsdelivr.net/npm/@cap.js/wasm@${WASM_VERSION}/browser/cap_wasm_bg.wasm`;
+
+    wasmModulePromise = fetch(wasmUrl)
+      .then((r) => {
+        if (!r.ok) throw new Error(`Failed to fetch wasm: ${r.status}`);
+        return r.arrayBuffer();
+      })
+      .then((buf) => WebAssembly.compile(buf))
+      .catch((e) => {
+        wasmModulePromise = null;
+        throw e;
+      });
+
+    return wasmModulePromise;
+  };
+
+  if (typeof WebAssembly === "object" && typeof WebAssembly.compile === "function") {
+    getWasmModule().catch(() => {});
+  }
+
+  const prefersReducedMotion = () =>
+    window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false;
+
+  const SPECULATIVE_DELAY_MS = 2500;
+  const SPECULATIVE_WORKERS = 1;
+  const SPECULATIVE_YIELD_MS = 120;
+
+  let _sharedWorkerUrl = null;
+
+  function _getSharedWorkerUrl() {
+    if (_sharedWorkerUrl) return _sharedWorkerUrl;
+
+    _sharedWorkerUrl = URL.createObjectURL(
+      new Blob([`%%workerScript%%`], { type: "application/javascript" }),
+    );
+    return _sharedWorkerUrl;
+  }
+
+  class WorkerPool {
+    constructor(size) {
+      this._size = size;
+      this._workers = [];
+      this._idle = [];
+      this._queue = [];
+      this._wasmModule = null;
+      this._spawnFailures = 0;
+    }
+
+    setWasm(wasmModule) {
+      this._wasmModule = wasmModule;
+    }
+
+    _spawn() {
+      const url = _getSharedWorkerUrl();
+      const w = new Worker(url);
+      w._busy = false;
+      this._workers.push(w);
+      this._idle.push(w);
+      return w;
+    }
+
+    _replaceWorker(deadWorker) {
+      const idx = this._workers.indexOf(deadWorker);
+      if (idx !== -1) this._workers.splice(idx, 1);
+      const idleIdx = this._idle.indexOf(deadWorker);
+      if (idleIdx !== -1) this._idle.splice(idleIdx, 1);
+
+      try {
+        deadWorker.terminate();
+      } catch {}
+
+      this._spawnFailures++;
+      if (this._spawnFailures > 3) {
+        console.error("[cap] worker spawn failed repeatedly, not retrying");
+        return null;
+      }
+
+      return this._spawn();
+    }
+
+    _ensureSize(n) {
+      while (this._workers.length < n) this._spawn();
+    }
+
+    run(salt, target) {
+      return new Promise((resolve, reject) => {
+        this._queue.push({ salt, target, resolve, reject });
+        this._dispatch();
+      });
+    }
+
+    _dispatch() {
+      while (this._idle.length > 0 && this._queue.length > 0) {
+        const worker = this._idle.shift();
+        const { salt, target, resolve, reject } = this._queue.shift();
+
+        let settled = false;
+
+        const onMessage = ({ data }) => {
+          if (settled) return;
+          settled = true;
+          worker.removeEventListener("message", onMessage);
+          worker.removeEventListener("error", onError);
+          this._spawnFailures = 0;
+          this._idle.push(worker);
+          if (!data.found) {
+            reject(new Error(data.error || "worker failed"));
+          } else {
+            resolve(data.nonce);
+          }
+          this._dispatch();
+        };
+
+        const onError = (err) => {
+          if (settled) return;
+          settled = true;
+          worker.removeEventListener("message", onMessage);
+          worker.removeEventListener("error", onError);
+          const replacement = this._replaceWorker(worker);
+          reject(err);
+          if (replacement) {
+            this._dispatch();
+          }
+        };
+
+        worker.addEventListener("message", onMessage);
+        worker.addEventListener("error", onError);
+
+        if (this._wasmModule) {
+          worker.postMessage({ salt, target, wasmModule: this._wasmModule }, []);
+        } else {
+          worker.postMessage({ salt, target });
+        }
+      }
+    }
+
+    terminate() {
+      for (const w of this._workers) {
+        try {
+          w.terminate();
+        } catch {}
+      }
+      this._workers = [];
+      this._idle = [];
+      this._queue = [];
+    }
+  }
+
+  class CapWidget extends HTMLElement {
+    #resetTimer = null;
+    #workersCount = navigator.hardwareConcurrency || 8;
+    token = null;
+    #shadow;
+    #div;
+    #host;
+    #solving = false;
+    #eventHandlers;
+
+    #speculative = null;
+    #speculativeTimer = null;
+    #speculativePool = null;
+    #interactionHandler = null;
+
+    get #hasHaptics() {
+      return _browserHasHaptics && !window.CAP_DISABLE_HAPTICS && !this.hasAttribute("data-cap-disable-haptics");
+    }
+
+    #makeSpeculativeState() {
+      return {
+        state: "idle",
+        challengeResp: null,
+        challenges: null,
+        results: [],
+        completedCount: 0,
+        solvePromise: null,
+        promoteFn: null,
+        _listeners: [],
+        pendingPromotion: null,
+        token: null,
+        tokenExpires: null,
+
+        notify() {
+          for (const fn of this._listeners) fn();
+          this._listeners = [];
+        },
+
+        onSettled(fn) {
+          if (this.state === "done" || this.state === "error") {
+            fn();
+          } else {
+            this._listeners.push(fn);
+          }
+        },
+      };
+    }
+
+    #resetSpeculativeState() {
+      this.#speculative = this.#makeSpeculativeState();
+      this.#attachInteractionListeners();
+    }
+
+    #detachInteractionListeners() {
+      if (this.#interactionHandler) {
+        window.removeEventListener("mousemove", this.#interactionHandler);
+        window.removeEventListener("touchstart", this.#interactionHandler);
+        window.removeEventListener("keydown", this.#interactionHandler);
+        this.#interactionHandler = null;
+      }
+    }
+
+    #attachInteractionListeners() {
+      this.#detachInteractionListeners();
+      const handler = () => {
+        this.#detachInteractionListeners();
+        this.#onFirstInteraction();
+      };
+      this.#interactionHandler = handler;
+      window.addEventListener("mousemove", handler, { passive: true });
+      window.addEventListener("touchstart", handler, { passive: true });
+      window.addEventListener("keydown", handler, { passive: true });
+    }
+
+    #isVisible() {
+      if (typeof this.checkVisibility === "function") {
+        return this.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true });
+      }
+      // Fallback: offsetParent is null for display:none; also check the style directly
+      return !!(this.offsetParent || this.getClientRects().length > 0);
+    }
+
+    #onFirstInteraction() {
+      if (this.#speculative.state !== "idle") return;
+      if (!this.#isVisible()) return;
+      this.#speculative.state = "waiting";
+      this.#speculativeTimer = setTimeout(() => {
+        this.#beginSpeculativeSolve();
+      }, SPECULATIVE_DELAY_MS);
+    }
+
+    async #beginSpeculativeSolve() {
+      if (this.#speculative.state !== "waiting") return;
+      this.#speculative.state = "fetching";
+
+      let apiEndpoint = this.getAttribute("data-cap-api-endpoint");
+      if (!apiEndpoint && window?.CAP_CUSTOM_FETCH) {
+        apiEndpoint = "/";
+      }
+      if (!apiEndpoint) {
+        this.#speculative.state = "idle";
+        return;
+      }
+      if (!apiEndpoint.endsWith("/")) apiEndpoint += "/";
+
+      try {
+        const raw = await capFetch(`${apiEndpoint}challenge`, { method: "POST" });
+        let resp;
+        try {
+          resp = await raw.json();
+        } catch {
+          throw new Error("Failed to parse speculative challenge response");
+        }
+        if (resp.error) throw new Error(resp.error);
+
+        resp._apiEndpoint = apiEndpoint;
+        this.#speculative.challengeResp = resp;
+
+        const { challenge, token } = resp;
+        let challenges = challenge;
+        if (!Array.isArray(challenges)) {
+          let i = 0;
+          challenges = Array.from({ length: challenge.c }, () => {
+            i++;
+            return [prng(`${token}${i}`, challenge.s), prng(`${token}${i}d`, challenge.d)];
+          });
+        }
+        this.#speculative.challenges = challenges;
+        this.#speculative.state = "solving";
+
+        this.#speculative.solvePromise = this.#speculativeSolveAll(challenges);
+      } catch (e) {
+        console.warn("[cap] speculative challenge fetch failed:", e);
+        this.#speculative.state = "error";
+        this.#speculative.notify();
+      }
+    }
+
+    async #speculativeSolveAll(challenges) {
+      _getSharedWorkerUrl();
+
+      let wasmModule = null;
+      try {
+        wasmModule = await getWasmModule();
+      } catch {}
+
+      if (!this.#speculativePool) {
+        this.#speculativePool = new WorkerPool(1);
+        this.#speculativePool._spawn();
+      }
+      this.#speculativePool.setWasm(wasmModule);
+
+      const total = challenges.length;
+      const results = new Array(total);
+
+      let concurrency = SPECULATIVE_WORKERS;
+      let promoted = false;
+
+      this.#speculative.promoteFn = (fullCount) => {
+        if (promoted) return;
+        promoted = true;
+        concurrency = fullCount;
+        this.#speculativePool._size = fullCount;
+        this.#speculativePool._ensureSize(fullCount);
+      };
+
+      if (this.#speculative.pendingPromotion !== null) {
+        this.#speculative.promoteFn(this.#speculative.pendingPromotion);
+        this.#speculative.pendingPromotion = null;
+      }
+
+      let nextIndex = 0;
+
+      while (nextIndex < total) {
+        const batchSize = concurrency;
+        const batch = [];
+        const batchIndices = [];
+
+        for (let i = 0; i < batchSize && nextIndex < total; i++) {
+          batchIndices.push(nextIndex);
+          batch.push(challenges[nextIndex]);
+          nextIndex++;
+        }
+
+        this.#speculativePool._ensureSize(Math.max(concurrency, batchSize));
+
+        const batchResults = await Promise.all(
+          batch.map((challenge) =>
+            this.#speculativePool.run(challenge[0], challenge[1]).then((nonce) => {
+              this.#speculative.completedCount++;
+              return nonce;
+            }),
+          ),
+        );
+
+        for (let i = 0; i < batchIndices.length; i++) {
+          results[batchIndices[i]] = batchResults[i];
+        }
+
+        if (!promoted && nextIndex < total) {
+          await new Promise((resolve) => setTimeout(resolve, SPECULATIVE_YIELD_MS));
+        }
+      }
+
+      this.#speculative.results = results;
+      this.#speculative.state = "redeeming";
+      this.#speculativeRedeem(results);
+      return results;
+    }
+
+    async #speculativeRedeem(solutions) {
+      try {
+        const challengeResp = this.#speculative.challengeResp;
+        const apiEndpoint = challengeResp._apiEndpoint;
+        if (!apiEndpoint) throw new Error("[cap] speculative redeem: missing apiEndpoint");
+
+        let instrOut = null;
+        if (challengeResp.instrumentation) {
+          instrOut = await runInstrumentationChallenge(challengeResp.instrumentation);
+          if (instrOut?.__timeout || instrOut?.__blocked) {
+            this.#speculative.state = "done";
+            this.#speculative.notify();
+            return;
+          }
+        }
+
+        const redeemRaw = await capFetch(`${apiEndpoint}redeem`, {
+          method: "POST",
+          body: JSON.stringify({
+            token: challengeResp.token,
+            solutions,
+            ...(instrOut && { instr: instrOut }),
+          }),
+          headers: { "Content-Type": "application/json" },
+        });
+
+        let resp;
+        try {
+          resp = await redeemRaw.json();
+        } catch {
+          throw new Error("Failed to parse speculative redeem response");
+        }
+
+        if (!resp.success) throw new Error(resp.error || "Speculative redeem failed");
+
+        this.#speculative.token = resp.token;
+        this.#speculative.tokenExpires = new Date(resp.expires).getTime();
+        this.#speculative.state = "done";
+        this.#speculative.notify();
+      } catch (e) {
+        console.warn("[cap] speculative redeem failed (will redo on click):", e);
+        this.#speculative.state = "done";
+        this.#speculative.notify();
+      }
+    }
+
+    getI18nText(key, defaultValue) {
+      return this.getAttribute(`data-cap-i18n-${key}`) || defaultValue;
+    }
+
+    static get observedAttributes() {
+      return [
+        "onsolve",
+        "onprogress",
+        "onreset",
+        "onerror",
+        "data-cap-worker-count",
+        "data-cap-i18n-initial-state",
+      ];
+    }
+
+    constructor() {
+      super();
+      if (this.#eventHandlers) {
+        this.#eventHandlers.forEach((handler, eventName) => {
+          this.removeEventListener(eventName.slice(2), handler);
+        });
+      }
+
+      this.#eventHandlers = new Map();
+      this.boundHandleProgress = this.handleProgress.bind(this);
+      this.boundHandleSolve = this.handleSolve.bind(this);
+      this.boundHandleError = this.handleError.bind(this);
+      this.boundHandleReset = this.handleReset.bind(this);
+    }
+
+    initialize() {
+      _getSharedWorkerUrl();
+      if (!this.#speculative) {
+        this.#speculative = this.#makeSpeculativeState();
+      }
+      if (!this.#speculativePool) {
+        this.#speculativePool = new WorkerPool(1);
+        this.#speculativePool._spawn();
+      }
+    }
+
+    attributeChangedCallback(name, _, value) {
+      if (name.startsWith("on")) {
+        const eventName = name.slice(2);
+        const oldHandler = this.#eventHandlers.get(name);
+        if (oldHandler) {
+          this.removeEventListener(eventName, oldHandler);
+        }
+
+        if (value) {
+          const handler = (event) => {
+            const callback = this.getAttribute(name);
+            if (typeof window[callback] === "function") {
+              window[callback].call(this, event);
+            }
+          };
+          this.#eventHandlers.set(name, handler);
+          this.addEventListener(eventName, handler);
+        }
+      }
+
+      if (name === "data-cap-worker-count") {
+        this.setWorkersCount(parseInt(value, 10));
+      }
+
+      if (
+        name === "data-cap-i18n-initial-state" &&
+        this.#div &&
+        this.#div?.querySelector(".label.active")
+      ) {
+        this.animateLabel(this.getI18nText("initial-state", "Verify you're human"));
+      }
+    }
+
+    async connectedCallback() {
+      this.#host = this;
+      this.#shadow = this.attachShadow({ mode: "open" });
+      this.#div = document.createElement("div");
+      this.createUI();
+      this.addEventListeners();
+      this.initialize();
+      this.#div.removeAttribute("disabled");
+
+      const workers = this.getAttribute("data-cap-worker-count");
+      const parsedWorkers = workers ? parseInt(workers, 10) : null;
+      this.setWorkersCount(parsedWorkers || navigator.hardwareConcurrency || 8);
+      const fieldName = this.getAttribute("data-cap-hidden-field-name") || "cap-token";
+      this.#host.innerHTML = `<input type="hidden" name="${fieldName}">`;
+
+      this.#attachInteractionListeners();
+    }
+
+    async solve() {
+      if (this.#solving) {
+        return;
+      }
+
+      try {
+        this.#solving = true;
+        this.updateUI("verifying", this.getI18nText("verifying-label", "Verifying..."), true);
+        this.#div.setAttribute(
+          "aria-label",
+          this.getI18nText("verifying-aria-label", "Verifying you're a human, please wait"),
+        );
+        this.dispatchEvent("progress", { progress: 0 });
+
+        try {
+          let apiEndpoint = this.getAttribute("data-cap-api-endpoint");
+          if (!apiEndpoint && window?.CAP_CUSTOM_FETCH) {
+            apiEndpoint = "/";
+          } else if (!apiEndpoint) {
+            throw new Error(
+              "Missing API endpoint. Either custom fetch or an API endpoint must be provided.",
+            );
+          }
+          if (!apiEndpoint.endsWith("/")) apiEndpoint += "/";
+
+          let solutions;
+          let challengeResp;
+
+          if (
+            this.#speculative.state === "done" &&
+            this.#speculative.token &&
+            this.#speculative.tokenExpires &&
+            Date.now() < this.#speculative.tokenExpires
+          ) {
+            this.dispatchEvent("progress", { progress: 100 });
+
+            const fieldName = this.getAttribute("data-cap-hidden-field-name") || "cap-token";
+            if (this.querySelector(`input[name='${fieldName}']`)) {
+              this.querySelector(`input[name='${fieldName}']`).value = this.#speculative.token;
+            }
+            this.dispatchEvent("solve", { token: this.#speculative.token });
+            this.token = this.#speculative.token;
+
+            const expiresIn = this.#speculative.tokenExpires - Date.now();
+            if (this.#resetTimer) clearTimeout(this.#resetTimer);
+            this.#resetTimer = setTimeout(() => this.reset(), expiresIn);
+
+            this.#div.setAttribute(
+              "aria-label",
+              this.getI18nText(
+                "verified-aria-label",
+                "We have verified you're a human, you may now continue",
+              ),
+            );
+            if (this.#hasHaptics) navigator.vibrate([10, 50, 20, 30, 40]);
+
+            this.#resetSpeculativeState();
+            this.#solving = false;
+            return { success: true, token: this.token };
+          }
+
+          if (this.#speculative.state === "done") {
+            solutions = this.#speculative.results;
+            challengeResp = this.#speculative.challengeResp;
+            this.dispatchEvent("progress", { progress: 100 });
+          } else if (
+            this.#speculative.state === "solving" ||
+            this.#speculative.state === "redeeming" ||
+            this.#speculative.state === "fetching" ||
+            this.#speculative.state === "waiting"
+          ) {
+            if (this.#speculative.state === "waiting") {
+              if (this.#speculativeTimer) {
+                clearTimeout(this.#speculativeTimer);
+                this.#speculativeTimer = null;
+              }
+              this.#speculative.state = "waiting";
+              this.#beginSpeculativeSolve();
+            }
+
+            this.#speculative.pendingPromotion = this.#workersCount;
+            if (this.#speculative.promoteFn) {
+              this.#speculative.promoteFn(this.#workersCount);
+            }
+
+            const progressInterval = setInterval(() => {
+              const st = this.#speculative.state;
+              if (st === "done" || st === "error") {
+                clearInterval(progressInterval);
+                return;
+              }
+              const total = this.#speculative.challenges ? this.#speculative.challenges.length : 1;
+              const done = this.#speculative.completedCount;
+              const visual =
+                st === "redeeming"
+                  ? 99
+                  : st === "fetching" || st === "waiting"
+                    ? 0
+                    : Math.min(98, Math.round((done / total) * 100));
+              this.dispatchEvent("progress", { progress: visual });
+            }, 150);
+
+            await new Promise((resolve) => this.#speculative.onSettled(resolve));
+            clearInterval(progressInterval);
+
+            if (this.#speculative.state !== "done") {
+              throw new Error("Speculative solve failed – please try again");
+            }
+
+            if (
+              this.#speculative.token &&
+              this.#speculative.tokenExpires &&
+              Date.now() < this.#speculative.tokenExpires
+            ) {
+              this.dispatchEvent("progress", { progress: 100 });
+
+              const fieldName = this.getAttribute("data-cap-hidden-field-name") || "cap-token";
+              if (this.querySelector(`input[name='${fieldName}']`)) {
+                this.querySelector(`input[name='${fieldName}']`).value = this.#speculative.token;
+              }
+              this.dispatchEvent("solve", { token: this.#speculative.token });
+              this.token = this.#speculative.token;
+
+              const expiresIn = this.#speculative.tokenExpires - Date.now();
+              if (this.#resetTimer) clearTimeout(this.#resetTimer);
+              this.#resetTimer = setTimeout(() => this.reset(), expiresIn);
+
+              this.#div.setAttribute(
+                "aria-label",
+                this.getI18nText(
+                  "verified-aria-label",
+                  "We have verified you're a human, you may now continue",
+                ),
+              );
+              if (this.#hasHaptics) navigator.vibrate([10, 50, 20, 30, 40]);
+
+              this.#resetSpeculativeState();
+              this.#solving = false;
+              return { success: true, token: this.token };
+            }
+
+            solutions = this.#speculative.results;
+            challengeResp = this.#speculative.challengeResp;
+            this.dispatchEvent("progress", { progress: 100 });
+          } else {
+            const challengeRaw = await capFetch(`${apiEndpoint}challenge`, {
+              method: "POST",
+            });
+            try {
+              challengeResp = await challengeRaw.json();
+            } catch {
+              throw new Error("Failed to parse challenge response from server");
+            }
+            if (challengeResp.error) throw new Error(challengeResp.error);
+
+            const { challenge, token } = challengeResp;
+            let challenges = challenge;
+            if (!Array.isArray(challenges)) {
+              let i = 0;
+              challenges = Array.from({ length: challenge.c }, () => {
+                i++;
+                return [prng(`${token}${i}`, challenge.s), prng(`${token}${i}d`, challenge.d)];
+              });
+            }
+
+            solutions = await this.solveChallenges(challenges);
+          }
+
+          const instrPromise = challengeResp.instrumentation
+            ? runInstrumentationChallenge(challengeResp.instrumentation)
+            : Promise.resolve(null);
+
+          const instrOut = await instrPromise;
+
+          if (instrOut?.__timeout || instrOut?.__blocked) {
+            this.updateUIBlocked(this.getI18nText("error-label", "Error"), instrOut?.__blocked);
+            this.#div.setAttribute(
+              "aria-label",
+              this.getI18nText("error-aria-label", "An error occurred, please try again"),
+            );
+            this.removeEventListener("error", this.boundHandleError);
+            const errEvent = new CustomEvent("error", {
+              bubbles: true,
+              composed: true,
+              detail: { isCap: true, message: "Instrumentation failed" },
+            });
+            super.dispatchEvent(errEvent);
+            this.addEventListener("error", this.boundHandleError);
+            this.executeAttributeCode("onerror", errEvent);
+            console.error("[cap]", "Instrumentation failed");
+            this.#solving = false;
+            return;
+          }
+
+          const { token } = challengeResp;
+
+          const redeemResponse = await capFetch(`${apiEndpoint}redeem`, {
+            method: "POST",
+            body: JSON.stringify({
+              token,
+              solutions,
+              ...(instrOut && { instr: instrOut }),
+            }),
+            headers: { "Content-Type": "application/json" },
+          });
+
+          let resp;
+          try {
+            resp = await redeemResponse.json();
+          } catch {
+            throw new Error("Failed to parse server response");
+          }
+
+          this.dispatchEvent("progress", { progress: 100 });
+          if (!resp.success) throw new Error(resp.error || "Invalid solution");
+
+          const fieldName = this.getAttribute("data-cap-hidden-field-name") || "cap-token";
+          if (this.querySelector(`input[name='${fieldName}']`)) {
+            this.querySelector(`input[name='${fieldName}']`).value = resp.token;
+          }
+
+          this.dispatchEvent("solve", { token: resp.token });
+          this.token = resp.token;
+
+          this.#resetSpeculativeState();
+
+          if (this.#resetTimer) clearTimeout(this.#resetTimer);
+          const expiresIn = new Date(resp.expires).getTime() - Date.now();
+          if (expiresIn > 0 && expiresIn < 24 * 60 * 60 * 1000) {
+            this.#resetTimer = setTimeout(() => this.reset(), expiresIn);
+          } else {
+            this.error("Invalid expiration time");
+          }
+
+          this.#div.setAttribute(
+            "aria-label",
+            this.getI18nText(
+              "verified-aria-label",
+              "We have verified you're a human, you may now continue",
+            ),
+          );
+          if (this.#hasHaptics) navigator.vibrate([10, 50, 20, 30, 40]);
+
+          return { success: true, token: this.token };
+        } catch (err) {
+          this.#div.setAttribute(
+            "aria-label",
+            this.getI18nText("error-aria-label", "An error occurred, please try again"),
+          );
+          this.error(err.message);
+          throw err;
+        }
+      } finally {
+        this.#solving = false;
+      }
+    }
+
+    async solveChallenges(challenges) {
+      const total = challenges.length;
+      let completed = 0;
+
+      const speculativeHead = 0;
+
+      let wasmModule = null;
+      const wasmSupported =
+        typeof WebAssembly === "object" && typeof WebAssembly.instantiate === "function";
+
+      if (wasmSupported) {
+        try {
+          wasmModule = await getWasmModule();
+        } catch (e) {
+          console.warn("[cap] wasm unavailable, falling back to JS solver:", e);
+        }
+      }
+
+      if (!wasmSupported) {
+        if (!this.#shadow.querySelector(".warning")) {
+          const warningEl = document.createElement("div");
+          warningEl.className = "warning";
+          warningEl.style.cssText = `width:var(--cap-widget-width,230px);background:rgb(237,56,46);color:white;padding:4px 6px;padding-bottom:calc(var(--cap-border-radius,14px) + 5px);font-size:10px;box-sizing:border-box;font-family:system-ui;border-top-left-radius:8px;border-top-right-radius:8px;text-align:center;user-select:none;margin-bottom:-35.5px;opacity:0;transition:margin-bottom .3s,opacity .3s;`;
+          warningEl.innerText = this.getI18nText(
+            "wasm-disabled",
+            "Enable WASM for significantly faster solving",
+          );
+          this.#shadow.insertBefore(warningEl, this.#shadow.firstChild);
+          setTimeout(() => {
+            warningEl.style.marginBottom = `calc(-1 * var(--cap-border-radius, 14px))`;
+            warningEl.style.opacity = 1;
+          }, 10);
+        }
+      }
+
+      const pool = new WorkerPool(this.#workersCount);
+      pool.setWasm(wasmModule);
+      pool._ensureSize(this.#workersCount);
+
+      const results = [];
+      try {
+        for (let i = 0; i < challenges.length; i += this.#workersCount) {
+          const chunk = challenges.slice(i, Math.min(i + this.#workersCount, challenges.length));
+          const chunkResults = await Promise.all(
+            chunk.map(([salt, target]) =>
+              pool.run(salt, target).then((nonce) => {
+                completed++;
+                const visual = Math.min(
+                  99,
+                  Math.round(((speculativeHead + completed) / total) * 100),
+                );
+                this.dispatchEvent("progress", { progress: visual });
+                return nonce;
+              }),
+            ),
+          );
+          results.push(...chunkResults);
+        }
+      } finally {
+        pool.terminate();
+      }
+
+      return results;
+    }
+
+    setWorkersCount(workers) {
+      const parsedWorkers = parseInt(workers, 10);
+      const maxWorkers = Math.min(navigator.hardwareConcurrency || 8, 16);
+      this.#workersCount =
+        !Number.isNaN(parsedWorkers) && parsedWorkers > 0 && parsedWorkers <= maxWorkers
+          ? parsedWorkers
+          : navigator.hardwareConcurrency || 8;
+    }
+
+    createUI() {
+      this.#div.classList.add("captcha");
+      this.#div.setAttribute("role", "button");
+      this.#div.setAttribute("tabindex", "0");
+      this.#div.setAttribute(
+        "aria-label",
+        this.getI18nText("verify-aria-label", "Click to verify you're a human"),
+      );
+      this.#div.setAttribute("aria-live", "polite");
+      this.#div.setAttribute("disabled", "true");
+      this.#div.innerHTML = `<div class="checkbox" part="checkbox"><svg class="progress-ring" viewBox="0 0 32 32"><circle class="progress-ring-bg" cx="16" cy="16" r="14"></circle><circle class="progress-ring-circle" cx="16" cy="16" r="14"></circle></svg></div><p part="label" class="label-wrapper"><span class="label active">${this.getI18nText(
+        "initial-state",
+        "Verify you're human",
+      )}</span></p><a part="attribution" aria-label="Secured by Cap" href="https://capjs.js.org/" class="credits" target="_blank" rel="follow noopener" title="Secured by Cap: Self-hosted CAPTCHA for the modern web.">Cap</a>`;
+
+      this.#shadow.innerHTML = `<style${window.CAP_CSS_NONCE ? ` nonce=${window.CAP_CSS_NONCE}` : ""}>%%capCSS%%</style>`;
+
+      this.#shadow.appendChild(this.#div);
+    }
+
+    addEventListeners() {
+      if (!this.#div) return;
+
+      this.#div.querySelector("a").addEventListener("click", (e) => {
+        e.stopPropagation();
+        e.preventDefault();
+        window.open("https://capjs.js.org", "_blank");
+      });
+
+      this.#div.addEventListener("click", () => {
+        if (!this.#div.hasAttribute("disabled")) this.solve();
+      });
+      this.#div.addEventListener("mousedown", () => {
+        if (!this.#div.hasAttribute("disabled") && this.#hasHaptics) {
+          navigator.vibrate(5);
+        }
+      });
+
+      this.#div.addEventListener("keydown", (e) => {
+        if ((e.key === "Enter" || e.key === " ") && !this.#div.hasAttribute("disabled")) {
+          e.preventDefault();
+          e.stopPropagation();
+          this.solve();
+        }
+      });
+
+      this.addEventListener("progress", this.boundHandleProgress);
+      this.addEventListener("solve", this.boundHandleSolve);
+      this.addEventListener("error", this.boundHandleError);
+      this.addEventListener("reset", this.boundHandleReset);
+    }
+
+    animateLabel(text) {
+      if (!this.#div) return;
+      const wrapper = this.#div.querySelector(".label-wrapper");
+      if (!wrapper) return;
+
+      if (prefersReducedMotion()) {
+        const current = wrapper.querySelector(".label.active");
+        if (current) {
+          current.textContent = text;
+        } else {
+          const span = document.createElement("span");
+          span.className = "label active";
+          span.textContent = text;
+          wrapper.appendChild(span);
+        }
+        return;
+      }
+
+      const current = wrapper.querySelector(".label.active");
+
+      const next = document.createElement("span");
+      next.className = "label";
+      next.textContent = text;
+      wrapper.appendChild(next);
+
+      void next.offsetWidth;
+
+      next.classList.add("active");
+      if (current) {
+        current.classList.remove("active");
+        current.classList.add("exit");
+        current.addEventListener("transitionend", () => current.remove(), {
+          once: true,
+        });
+      }
+    }
+
+    updateUI(state, text, disabled = false) {
+      if (!this.#div) return;
+
+      this.#div.setAttribute("data-state", state);
+
+      this.animateLabel(text);
+
+      if (disabled) {
+        this.#div.setAttribute("disabled", "true");
+      } else {
+        this.#div.removeAttribute("disabled");
+      }
+    }
+
+    updateUIBlocked(label, showTroubleshooting = false) {
+      if (!this.#div) return;
+
+      this.#div.setAttribute("data-state", "error");
+      this.#div.removeAttribute("disabled");
+
+      const wrapper = this.#div.querySelector(".label-wrapper");
+      if (!wrapper) return;
+
+      const troubleshootingUrl =
+        this.getAttribute("data-cap-troubleshooting-url") ||
+        "https://capjs.js.org/guide/troubleshooting/instrumentation.html";
+
+      const current = wrapper.querySelector(".label.active");
+      const next = document.createElement("span");
+      next.className = "label";
+      next.innerHTML = showTroubleshooting
+        ? `${label} · <a class="cap-troubleshoot-link" href="${troubleshootingUrl}" target="_blank" rel="noopener">${this.getI18nText("troubleshooting-label", "Troubleshoot")}</a>`
+        : label;
+      wrapper.appendChild(next);
+
+      void next.offsetWidth;
+      next.classList.add("active");
+      if (current) {
+        current.classList.remove("active");
+        current.classList.add("exit");
+        current.addEventListener("transitionend", () => current.remove(), {
+          once: true,
+        });
+      }
+
+      const link = next.querySelector(".cap-troubleshoot-link");
+      if (link) {
+        link.addEventListener("click", (e) => {
+          e.stopPropagation();
+        });
+      }
+    }
+
+    handleProgress(event) {
+      if (!this.#div) return;
+
+      const progressCircle = this.#div.querySelector(".progress-ring-circle");
+
+      if (progressCircle) {
+        const circumference = 2 * Math.PI * 14;
+        const offset = circumference - (event.detail.progress / 100) * circumference;
+        progressCircle.style.strokeDashoffset = offset;
+      }
+
+      const wrapper = this.#div.querySelector(".label-wrapper");
+      if (wrapper) {
+        const activeLabel = wrapper.querySelector(".label.active");
+        if (activeLabel) {
+          activeLabel.textContent = `${this.getI18nText("verifying-label", "Verifying...")}`;
+        }
+      }
+
+      this.executeAttributeCode("onprogress", event);
+    }
+
+    handleSolve(event) {
+      this.updateUI("done", this.getI18nText("solved-label", "You're a human"), true);
+      this.executeAttributeCode("onsolve", event);
+    }
+
+    handleError(event) {
+      this.updateUI("error", this.getI18nText("error-label", "Error. Try again."));
+      this.executeAttributeCode("onerror", event);
+
+      if (this.#hasHaptics) navigator.vibrate([10, 40, 10]);
+    }
+
+    handleReset(event) {
+      this.updateUI("", this.getI18nText("initial-state", "I'm a human"));
+      this.executeAttributeCode("onreset", event);
+    }
+
+    executeAttributeCode(attributeName, event) {
+      const code = this.getAttribute(attributeName);
+      if (!code) {
+        return;
+      }
+
+      console.error(
+        "[cap] using `onxxx='…'` is strongly discouraged and will be deprecated soon. please use `addEventListener` callbacks instead.",
+      );
+
+      new Function("event", code).call(this, event);
+    }
+
+    error(message = "Unknown error") {
+      console.error("[cap]", message);
+      this.dispatchEvent("error", { isCap: true, message });
+    }
+
+    dispatchEvent(eventName, detail = {}) {
+      const event = new CustomEvent(eventName, {
+        bubbles: true,
+        composed: true,
+        detail,
+      });
+      super.dispatchEvent(event);
+    }
+
+    reset() {
+      if (this.#resetTimer) {
+        clearTimeout(this.#resetTimer);
+        this.#resetTimer = null;
+      }
+      this.dispatchEvent("reset");
+      this.token = null;
+      const fieldName = this.getAttribute("data-cap-hidden-field-name") || "cap-token";
+      if (this.querySelector(`input[name='${fieldName}']`)) {
+        this.querySelector(`input[name='${fieldName}']`).value = "";
+      }
+    }
+
+    get tokenValue() {
+      return this.token;
+    }
+
+    disconnectedCallback() {
+      this.removeEventListener("progress", this.boundHandleProgress);
+      this.removeEventListener("solve", this.boundHandleSolve);
+      this.removeEventListener("error", this.boundHandleError);
+      this.removeEventListener("reset", this.boundHandleReset);
+
+      this.#eventHandlers.forEach((handler, eventName) => {
+        this.removeEventListener(eventName.slice(2), handler);
+      });
+      this.#eventHandlers.clear();
+
+      if (this.#shadow) {
+        this.#shadow.innerHTML = "";
+      }
+
+      this.reset();
+      this.cleanup();
+    }
+
+    cleanup() {
+      if (this.#resetTimer) {
+        clearTimeout(this.#resetTimer);
+        this.#resetTimer = null;
+      }
+
+      this.#detachInteractionListeners();
+      if (this.#speculativeTimer) {
+        clearTimeout(this.#speculativeTimer);
+        this.#speculativeTimer = null;
+      }
+      if (this.#speculativePool) {
+        this.#speculativePool.terminate();
+        this.#speculativePool = null;
+      }
+      if (this.#speculative) {
+        this.#speculative.state = "error";
+        this.#speculative.notify();
+        this.#speculative = null;
+      }
+    }
+  }
+
+  class Cap {
+    constructor(config = {}, el) {
+      const widget = el || document.createElement("cap-widget");
+
+      Object.entries(config).forEach(([a, b]) => {
+        widget.setAttribute(a, b);
+      });
+
+      if (!config.apiEndpoint && !window?.CAP_CUSTOM_FETCH) {
+        widget.remove();
+        throw new Error(
+          "Missing API endpoint. Either custom fetch or an API endpoint must be provided.",
+        );
+      }
+
+      if (config.apiEndpoint) {
+        widget.setAttribute("data-cap-api-endpoint", config.apiEndpoint);
+      }
+
+      if (!el && !widget.hasAttribute("data-cap-disable-haptics")) {
+        widget.setAttribute("data-cap-disable-haptics", "");
+      }
+
+      this.widget = widget;
+      this.solve = this.widget.solve.bind(this.widget);
+      this.reset = this.widget.reset.bind(this.widget);
+      this.addEventListener = this.widget.addEventListener.bind(this.widget);
+
+      Object.defineProperty(this, "token", {
+        get: () => widget.token,
+        configurable: true,
+        enumerable: true,
+      });
+
+      if (!el) {
+        widget.style.display = "none";
+        document.documentElement.appendChild(widget);
+      }
+    }
+  }
+
+  window.Cap = Cap;
+
+  if (!customElements.get("cap-widget") && !window?.CAP_DONT_SKIP_REDEFINE) {
+    customElements.define("cap-widget", CapWidget);
+  } else if (customElements.get("cap-widget")) {
+    console.warn(
+      "[cap] the cap-widget element has already been defined, skipping re-defining it.\nto prevent this, set window.CAP_DONT_SKIP_REDEFINE to true",
+    );
+  }
+
+  if (typeof exports === "object" && typeof module !== "undefined") {
+    module.exports = Cap;
+  } else if (typeof define === "function" && define.amd) {
+    define([], () => Cap);
+  }
+
+  if (typeof exports !== "undefined") {
+    exports.default = Cap;
+  }
 })();

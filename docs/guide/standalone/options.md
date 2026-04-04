@@ -43,19 +43,20 @@ By default, Standalone will use Elysia's built-in `server.requestIP` function to
 
 If so, you can change the IP extraction logic to simply read from a header set in `RATELIMIT_IP_HEADER` in your env. For example, if you were using Cloudflare, you might set `RATELIMIT_IP_HEADER` to `cf-connecting-ip`. On most setups, this is `x-forwarded-for`.
 
-The `/siteverify` endpoint is intended for server-to-server use, so each request checks if your key's secret is valid. If it is, the request is allowed. If not, the request is denied and the client's IP is temporarily blocked for a few hundred milliseconds. This prevents database strain without affecting legitimate requests.
+The `/siteverify` endpoint is intended for server-to-server use, so it's not ratelimited by default.
 
-If you're interested in an option to fully disable ratelimiting, let us know using GitHub issues.
+## Redis / Valkey
 
-## Custom data path
+Cap Standalone uses Redis (or Valkey) for all data storage. Set the `REDIS_URL` environment variable to your Redis connection string. This defaults to `redis://localhost:6379`.
 
-If you would like the data to be stored in a custom path inside the container, you can set the `DATA_PATH` environment variable to the desired path. Note that this only works in Standalone 2.0.9 or above.
+The recommended setup uses Valkey (a Redis-compatible store) via the docker-compose file provided in the [quickstart guide](/guide/standalone/).
 
-## Custom DB URLs
+## Error messages
 
-If you would like to use a different database, you can set the `DB_URL` environment variable to the URL of the database you want to use.
+Error messages are redacted by default and instead logged to the console. To disable error logging, set `DISABLE_ERROR_LOGGING=true`. To disable error message redaction, set `SHOW_ERRORS=true`.
 
-We recommend keeping this to the default value, which is `sqlite://./.data/db.sqlite.`. However, using Postgres, MySQL, or any other database supported by Bun SQL might be possible, even though not officially supported or tested:
+## Instrumentation challenges
 
-- `postgres://user:pass@localhost:5432/mydb`
-- `mysql://user:password@localhost:3306/database`
+Cap Standalone supports JavaScript instrumentation challenges to defeat proof-of-work solvers, along with options to block headless browsers from solving them. Instrumentation challenges are enabled by default when creating new site keys.
+
+You can toggle instrumentation challenges on or off in your site key config. To block headless browsers, turn on "Attempt to block headless browsers" in the key settings.

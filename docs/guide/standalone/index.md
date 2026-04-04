@@ -1,86 +1,88 @@
 # Cap Standalone
 
-Cap Standalone is a self-hosted version of Cap's backend that allows you to spin up a server to validate and create challenges so you can use it with languages other than JS.
+Cap Standalone is the recommended way to self-host Cap's backend. It runs on Bun and keeps idle memory usage around 50 MB. It ships with built-in support for instrumentation challenges, which significantly raise the bar for bots, a siteverify API compatible with reCAPTCHA, and a web dashboard for managing multiple site keys.
 
-It's simple yet powerful, allowing you to use Cap in any language that can make HTTP requests. It's mostly compatible with reCAPTCHA and hCaptcha's siteverify enpoints, so you can use it as a drop-in replacement for them.
-
-It also offers API key support, a built-in assets server, a dashboard with statistics, and more.
-
-![Screenshot of Cap's standalone mode](/standalone_screenshot.png)
+We recommend using [Docker](https://docs.docker.com/get-docker/) to run Cap Standalone.
 
 ## Installation
 
-### Requirements
+Create a `docker-compose.yml` file:
 
-You'll need to have [Docker Engine 20.10 or higher](https://docs.docker.com/get-docker/) installed on your server. Both `x86_64` (amd64) and `arm64` architectures are supported.
+```yaml
+services:
+  cap:
+    image: tiago2/cap:latest
+    container_name: cap
+    ports:
+      - "3000:3000"
+    environment:
+      ADMIN_KEY: your_secret_password
+      REDIS_URL: redis://valkey:6379
+    depends_on:
+      valkey:
+        condition: service_healthy
+    restart: unless-stopped
 
----
+  valkey:
+    image: valkey/valkey:8-alpine
+    container_name: cap-valkey
+    volumes:
+      - valkey-data:/data
+    command: valkey-server --save 60 1 --loglevel warning --maxmemory-policy noeviction
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
 
-Run the following command to pull the Cap Standalone Docker image from Docker Hub:
-
-```bash
-docker pull tiago2/cap:latest
+volumes:
+  valkey-data:
 ```
 
-Then, to run the server, use the following command:
+::: tip Tips
+
+- `ADMIN_KEY` is your dashboard's login. We recommend making it at least 32 characters
+- Change `3000:3000` if that port is already in use on your host.
+- If the dashboard is unreachable, try adding `network_mode: "host"` under the `cap` service.
+  :::
+
+Start the container:
 
 ```bash
-docker run -d \
-  -p 3000:3000 \
-  -v cap-data:/usr/src/app/.data \
-  -e ADMIN_KEY=your_secret_password \
-  --name cap-standalone \
-  tiago2/cap:latest
+docker compose up -d
 ```
 
-Make sure to replace `your_secret_password` with a strong password, as anyone with it will be able to log into the dashboard and create keys. It'll need to be at least 30 characters long.
+Open `http://localhost:3000` (or your server's IP/domain on port 3000) to access the dashboard. Log in with your admin key, create a site key, and note down both the **site key** and its **secret key**, you'll need both.
 
-Then, you can access the dashboard at `http://localhost:3000`, log in, and create a key. You'll get a site key and a secret key which you'll be able to use on your widget.
+Instrumentation challenges are enabled by default when creating new site keys. We recommend keeping them on, as they significantly raise the bar for bots. You can also enable headless browser detection for additional protection.
 
-On Debian and other OSes that don't use `iptables`, if you can't open the dashboard, try setting `--network=host` in the run command. Thanks to [Boro Vukovic](https://github.com/tiagozip/cap/issues/70#issuecomment-3086464282) for letting me know about this.
-
-You'll also need to make the server publicly accessible from the internet, as the widget needs to be able to reach it. If you're using a reverse proxy, make sure to check [the options guide](/guide/standalone/options.md) to configure rate-limiting properly.
+Your Cap Standalone instance must be publicly reachable from the internet so the widget can communicate with it. If you're using a reverse proxy, review the [options guide](/guide/standalone/options.md) to configure rate-limiting correctly.
 
 ## Usage
 
 ### Client-side
 
-Let's configure your widget to use your self-hosted Cap Standalone server. To do this, set the widget's API endpoint option to:
+Point the widget at your instance by setting the `data-cap-api-endpoint` attribute:
 
 ```
 https://<instance_url>/<site_key>/
 ```
 
-Make sure to replace:
-
-- `<instance_url>`: The actual URL where your Cap Standalone instance is running. This URL must be publicly accessible from the internet.
-- `<site_key>`: Your site key from this dashboard.
+- `<instance_url>` — the public URL of your Cap Standalone instance
+- `<site_key>` — the site key from your dashboard
 
 Example:
 
 ```html
-<cap-widget
-  data-cap-api-endpoint="https://cap.example.com/d9256640cb53/"
-></cap-widget>
+<cap-widget data-cap-api-endpoint="https://cap.example.com/d9256640cb53/"></cap-widget>
 ```
+
+We recommend reading our [widget documentation](../widget.md) for more details and example snippets for multiple frameworks.
 
 ### Server-side
 
-After a user completes the CAPTCHA on your site, your backend needs to verify their token using this server's API.
-
-You can do this by sending a `POST` request from your server to the following endpoint:
-
-```
-https://<instance_url>/<site_key>/siteverify
-```
-
-Your request needs to include the following data:
-
-- `secret`: Your key secret from this dashboard. This is **not** the admin key, but rather your site key's secret.
-
-- `response`: The CAPTCHA token generated by the widget on the client-side
-
-Example using `curl`:
+Once a user completes the CAPTCHA, your backend must verify the token before trusting it. Send a `POST` request to your instance's `/siteverify` endpoint with the following JSON body:
 
 ```bash
 curl "https://<instance_url>/<site_key>/siteverify" \
@@ -89,24 +91,10 @@ curl "https://<instance_url>/<site_key>/siteverify" \
   -d '{ "secret": "<key_secret>", "response": "<captcha_token>" }'
 ```
 
-The response should look like this:
+Where `<key_secret>` is the secret key from your dashboard (**not** the dashboard admin key), and `<captcha_token>` is the challenge token generated by the widget.
+
+A successful verification returns:
 
 ```json
-{
-  "success": true
-}
+{ "success": true }
 ```
-
-Or, if the captcha token is invalid or expired, it will return:
-
-```json
-{
-  "success": false
-}
-```
-
-If `success` is true, you can proceed with your app logic.
-
-### Client-side library storage
-
-Cap Standalone can also serve the widget and floating client-side library files. [Learn more](options.md#asset-server).

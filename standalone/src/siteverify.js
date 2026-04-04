@@ -2,81 +2,61 @@ import { cors } from "@elysiajs/cors";
 import { Elysia } from "elysia";
 
 import { db } from "./db.js";
-import { ratelimitGenerator } from "./ratelimit.js";
+import { checkCorsOrigin } from "./settings-cache.js";
 
-const blockedIPs = new Map();
-
-setInterval(() => {
-	const now = Date.now();
-	for (const [ip, unblockTime] of blockedIPs.entries()) {
-		if (now >= unblockTime) {
-			blockedIPs.delete(ip);
-		}
-	}
-}, 2000);
+function hourlyBucket() {
+  return String(Math.floor(Date.now() / 1000 / 3600) * 3600);
+}
 
 export const siteverifyServer = new Elysia({
-	detail: {
-		tags: ["Challenges"],
-	},
+  detail: {
+    tags: ["Challenges"],
+  },
 })
-	.use(
-		cors({
-			origin: process.env.CORS_ORIGIN?.split(",") || true,
-			methods: ["POST"],
-		}),
-	)
-	.post("/:siteKey/siteverify", async ({ body, set, params, request, server }) => {
-		const ip = ratelimitGenerator(request, server);
-		const now = Date.now();
-		
-		const unblockTime = blockedIPs.get(ip);
-		if (unblockTime && now < unblockTime) {
-			const retryAfter = Math.ceil((unblockTime - now) / 1000);
-			set.status = 429;
-			set.headers["Retry-After"] = retryAfter.toString();
-			set.headers["X-RateLimit-Limit"] = "1";
-			set.headers["X-RateLimit-Remaining"] = "0";
-			set.headers["X-RateLimit-Reset"] = Math.ceil(unblockTime / 1000).toString();
-			return { error: "You were temporarily for using an invalid secret key. Please try again later." };
-		}
+  .use(
+    cors({
+      origin: checkCorsOrigin,
+      methods: ["POST"],
+    }),
+  )
+  .post("/:siteKey/siteverify", async ({ body, set, params }) => {
+    const sitekey = params.siteKey;
+    const { secret, response } = body;
 
-		const sitekey = params.siteKey;
-		const { secret, response } = body;
+    if (!sitekey || !secret || !response) {
+      set.status = 400;
+      return { success: false, error: "Missing required parameters" };
+    }
 
-		if (!sitekey || !secret || !response) {
-			set.status = 400;
-			return { error: "Missing required parameters" };
-		}
+    const secretHash = await db.hget(`key:${sitekey}`, "secretHash");
 
-		const [keyData] = await db`SELECT * FROM keys WHERE siteKey = ${sitekey}`;
-		const keyHash = keyData?.secretHash;
-		if (!keyHash || !secret) {
-			set.status = 404;
-			return { error: "Invalid site key or secret" };
-		}
+    if (!secretHash || !secret) {
+      set.status = 404;
+      return { success: false, error: "Invalid site key or secret" };
+    }
 
-		const isValidSecret = await Bun.password.verify(secret, keyHash);
-		
-		if (!isValidSecret) {
-			blockedIPs.set(ip, now + 250);
-			set.status = 403;
-			return { error: "Invalid site key or secret" };
-		}
+    const isValidSecret = await Bun.password.verify(secret, secretHash);
 
-		const [token] = await db`SELECT * FROM tokens WHERE siteKey = ${params.siteKey} AND token = ${response}`;
+    if (!isValidSecret) {
+      set.status = 403;
+      return { success: false, error: "Invalid site key or secret" };
+    }
 
-		if (!token) {
-			set.status = 404;
-			return { error: "Token not found" };
-		}
+    const tokenKey = `token:${params.siteKey}:${response}`;
+    const expires = await db.send("GETDEL", [tokenKey]);
 
-		if (token.expires < Date.now()) {
-			await db`DELETE FROM tokens WHERE siteKey = ${params.siteKey} AND token = ${response}`;
-			set.status = 403;
-			return { error: "Token expired" };
-		}
+    if (!expires) {
+      set.status = 404;
+      await db.hincrby(`metrics:failed:${sitekey}`, hourlyBucket(), 1);
+      return { success: false, error: "Token not found" };
+    }
 
-		await db`DELETE FROM tokens WHERE siteKey = ${params.siteKey} AND token = ${response}`;
-		return { success: true };
-	});
+    if (Number(expires) < Date.now()) {
+      set.status = 403;
+      await db.hincrby(`metrics:failed:${sitekey}`, hourlyBucket(), 1);
+      return { success: false, error: "Token expired" };
+    }
+
+    await db.hincrby(`metrics:verified:${sitekey}`, hourlyBucket(), 1);
+    return { success: true };
+  });
