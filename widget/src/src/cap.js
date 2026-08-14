@@ -585,7 +585,13 @@
         this.#speculative.challenges = challenges;
         this.#speculative.state = "solving";
 
-        this.#speculative.solvePromise = this.#speculativeSolveAll(challenges);
+        this.#speculative.solvePromise = this.#speculativeSolveAll(
+          challenges,
+        ).catch(() => {
+          if (!this.#speculative) return;
+          this.#speculative.state = "error";
+          this.#speculative.notify();
+        });
       } catch {
         if (!this.#speculative) return;
         this.#speculative.state = "error";
@@ -601,6 +607,7 @@
         wasmModule = await getWasmModule();
       } catch {}
 
+      if (!this.#speculative) return [];
       if (!this.#speculativePool) {
         this.#speculativePool = new WorkerPool(1);
         this.#speculativePool._spawn();
@@ -614,7 +621,7 @@
       let promoted = false;
 
       this.#speculative.promoteFn = (fullCount) => {
-        if (promoted) return;
+        if (promoted || !this.#speculativePool) return;
         promoted = true;
         concurrency = fullCount;
         this.#speculativePool._size = fullCount;
@@ -629,6 +636,7 @@
       let nextIndex = 0;
 
       while (nextIndex < total) {
+        if (!this.#speculative || !this.#speculativePool) return results;
         const batchSize = concurrency;
         const batch = [];
         const batchIndices = [];
