@@ -4,12 +4,57 @@ const redisUrl =
   process.env.REDIS_URL || process.env.VALKEY_URL || "redis://localhost:6379";
 const prefix = process.env.REDIS_PREFIX || "";
 
-const client = new RedisClient(redisUrl);
+let client = new RedisClient(redisUrl);
+let reconnecting = null;
 
 await client.send("PING", []);
 
-const addPrefix = (k) =>
-  typeof k === "string" && k.length ? prefix + k : k;
+const CONNECTION_ERRORS = new Set([
+  "ERR_REDIS_CONNECTION_CLOSED",
+  "ERR_REDIS_CONNECTION_TIMEOUT",
+]);
+
+const reconnect = () => {
+  reconnecting ??= (async () => {
+    console.error("[cap] redis connection lost, reconnecting");
+    for (let delay = 500; ; delay = Math.min(delay * 2, 15000)) {
+      const next = new RedisClient(redisUrl, { connectionTimeout: 3000 });
+      try {
+        await next.send("PING", []);
+      } catch {
+        next.close();
+        await Bun.sleep(delay);
+        continue;
+      }
+      try {
+        client.close();
+      } catch {}
+      client = next;
+      console.error("[cap] redis reconnected");
+      return;
+    }
+  })().finally(() => {
+    reconnecting = null;
+  });
+  return reconnecting;
+};
+
+async function withReconnect(run) {
+  try {
+    return await run();
+  } catch (error) {
+    if (!CONNECTION_ERRORS.has(error?.code)) throw error;
+    await Promise.race([reconnect(), Bun.sleep(4000)]);
+    try {
+      return await run();
+    } catch (retryError) {
+      if (CONNECTION_ERRORS.has(retryError?.code)) reconnect();
+      throw retryError;
+    }
+  }
+}
+
+const addPrefix = (k) => (typeof k === "string" && k.length ? prefix + k : k);
 const stripPrefix = (k) =>
   typeof k === "string" && k.startsWith(prefix) ? k.slice(prefix.length) : k;
 
@@ -42,39 +87,45 @@ const KEY_ALL = new Set(["del", "unlink", "exists", "mget"]);
 
 const MULTI_KEY_CMDS = new Set(["DEL", "UNLINK", "MGET", "EXISTS"]);
 
-function prefixedSend(cmd, args = []) {
-  const upper = cmd.toUpperCase();
-  if (upper === "PING" || !args.length) return client.send(cmd, args);
-  if (upper === "KEYS") {
-    return client
-      .send(cmd, [addPrefix(args[0]), ...args.slice(1)])
-      .then((res) => (Array.isArray(res) ? res.map(stripPrefix) : res));
-  }
-  if (MULTI_KEY_CMDS.has(upper)) {
-    return client.send(cmd, args.map(addPrefix));
-  }
-  return client.send(cmd, [addPrefix(args[0]), ...args.slice(1)]);
+function rawSend(cmd, args = []) {
+  return withReconnect(() => client.send(cmd, args));
 }
 
-const db = prefix
-  ? new Proxy(client, {
-      get(target, prop, receiver) {
-        if (prop === "send") return prefixedSend;
-        const value = Reflect.get(target, prop, receiver);
-        if (typeof value !== "function") return value;
-        if (KEY_FIRST.has(prop)) {
-          return (...args) => {
-            if (args.length) args[0] = addPrefix(args[0]);
-            return value.apply(target, args);
-          };
-        }
-        if (KEY_ALL.has(prop)) {
-          return (...args) => value.apply(target, args.map(addPrefix));
-        }
-        return value.bind(target);
-      },
-    })
-  : client;
+function prefixedSend(cmd, args = []) {
+  const upper = cmd.toUpperCase();
+  if (upper === "PING" || !args.length) return rawSend(cmd, args);
+  if (upper === "KEYS") {
+    return rawSend(cmd, [addPrefix(args[0]), ...args.slice(1)]).then((res) =>
+      Array.isArray(res) ? res.map(stripPrefix) : res,
+    );
+  }
+  if (MULTI_KEY_CMDS.has(upper)) {
+    return rawSend(cmd, args.map(addPrefix));
+  }
+  return rawSend(cmd, [addPrefix(args[0]), ...args.slice(1)]);
+}
+
+const db = new Proxy(
+  {},
+  {
+    get(_target, prop) {
+      if (prop === "send") return prefix ? prefixedSend : rawSend;
+      const value = client[prop];
+      if (typeof value !== "function") return value;
+      if (prefix && KEY_FIRST.has(prop)) {
+        return (...args) => {
+          if (args.length) args[0] = addPrefix(args[0]);
+          return withReconnect(() => client[prop](...args));
+        };
+      }
+      if (prefix && KEY_ALL.has(prop)) {
+        return (...args) =>
+          withReconnect(() => client[prop](...args.map(addPrefix)));
+      }
+      return (...args) => withReconnect(() => client[prop](...args));
+    },
+  },
+);
 
 export async function hgetall(key) {
   const data = await db.send("HGETALL", [key]);
